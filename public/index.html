@@ -206,7 +206,11 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
     return 'ag_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,9);
   }
 
-  // ---------------- backend API helpers (Netlify Function -> Airtable) ----------------
+  // ---------------- backend API helper (Netlify Function -> Airtable) ----------------
+  // The only thing the backend does now is fetch a trainee's existing
+  // contact details. There is no shareable link, no token, no second
+  // signature step — the trainee fills out the whole form in one sitting,
+  // downloads the signed PDF, and sends it to their coach themselves.
   const API_ENDPOINT = '/.netlify/functions/agreement';
 
   async function apiCall(action, body){
@@ -236,76 +240,14 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
     return data;
   }
 
-  async function submitAgreement(traineeRecordId, record, coachAirtableId, manualTraineeName){
-    const data = await apiCall('submit', { traineeRecordId, record, coachAirtableId, manualTraineeName });
-    return data.token;
-  }
-
-  async function loadAgreementByToken(token){
+  async function fetchTraineeDetails(traineeRecordId){
     try{
-      const data = await apiCall('load', { token });
-      return { record: data.record, error: null };
+      const data = await apiCall('lookup-trainee', { traineeRecordId });
+      return data.trainee || null;
     } catch(e){
-      return { record: null, error: e.message || 'שגיאה לא ידועה' };
+      console.error(e);
+      return null;
     }
-  }
-
-  async function completeAgreement(token, coachSignature, coachSignedAt){
-    const data = await apiCall('complete', { token, coachSignature, coachSignedAt });
-    return data.record;
-  }
-
-  function buildLink(token){
-    const url = new URL(window.location.href);
-    url.search = '';
-    url.searchParams.set('token', token);
-    return url.toString();
-  }
-
-  // Copies text using whichever mechanism actually works in the current context.
-  // The async Clipboard API is frequently blocked by permissions policy inside
-  // sandboxed iframes (e.g. artifact previews) and fails *silently* if nothing
-  // catches the rejection — that silent failure is what made the link look
-  // "invalid" (nothing was ever actually on the clipboard). This always reports
-  // honestly whether the copy worked, and falls back to manual selection.
-  async function copyLinkToClipboard(text){
-    const btn = $('copyLinkBtn');
-    const input = $('linkBox');
-    let copied = false;
-
-    if(navigator.clipboard && navigator.clipboard.writeText){
-      try{
-        await navigator.clipboard.writeText(text);
-        copied = true;
-      } catch(e){
-        copied = false;
-      }
-    }
-
-    if(!copied && input){
-      try{
-        input.removeAttribute('disabled');
-        input.focus();
-        input.select();
-        input.setSelectionRange(0, text.length);
-        copied = document.execCommand && document.execCommand('copy');
-      } catch(e){
-        copied = false;
-      }
-    }
-
-    if(btn){
-      if(copied){
-        btn.textContent = '✓ הועתק!';
-        btn.classList.add('copied');
-        setTimeout(()=>{ btn.textContent = 'העתק קישור'; btn.classList.remove('copied'); }, 2500);
-      } else {
-        btn.textContent = 'ההעתקה לא הצליחה — סמן/י ידנית למעלה';
-        if(input){ input.focus(); input.select(); }
-        setTimeout(()=>{ btn.textContent = 'העתק קישור'; }, 3500);
-      }
-    }
-    return copied;
   }
 
   // ---------------- signature pad ----------------
@@ -515,7 +457,6 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
     row('כתובת', data.trainee.address);
     row('תאריך לידה', data.trainee.dob);
     row('מצב משפחתי', data.trainee.marital);
-    row('פרטי עיסוק', data.trainee.occupation);
     y += 3;
 
     sectionTitle('מצב בריאותי');
@@ -742,6 +683,8 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
         state.traineeRecordId = tr.id;
         state.traineeManual = false;
         state.trainee_name = tr.name;
+        state.trainee_email = null;
+        state.trainee_phone = null;
         $('traineeSearch').value = '';
         $('traineeResults').classList.remove('show');
         $('traineeSelectedLabel').textContent = state.trainee_name;
@@ -750,6 +693,22 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
         $('traineeManualBtn').style.display = 'none';
         $('traineeManualWrap').style.display = 'none';
         setErr('err0b', false);
+
+        // Fetch existing contact details in the background so step 1 can
+        // pre-fill them; the trainee can still edit anything once there.
+        state.traineeLookupPending = true;
+        fetchTraineeDetails(tr.id).then(details=>{
+          state.traineeLookupPending = false;
+          if(details){
+            if(details.email) state.trainee_email = details.email;
+            if(details.phone) state.trainee_phone = details.phone;
+          }
+          if(current===1){
+            if(state.trainee_email && !$('f_email').value) $('f_email').value = state.trainee_email;
+            if(state.trainee_phone && !$('f_phone').value) $('f_phone').value = state.trainee_phone;
+            $('step1Hint').textContent = 'נא למלא את הפרטים האישיים שלך';
+          }
+        }).catch(()=>{ state.traineeLookupPending = false; });
       }
       $('traineeClearBtn') && $('traineeClearBtn').addEventListener('click', ()=>{
         state.traineeRecordId = null;
@@ -800,10 +759,18 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
       return `
         <div class="card">
           <h2>פרטי המתאמן/ת</h2>
-          <p class="hint">הפרטים הבאים מולאו מהמערכת — נא לעדכן אם משהו השתנה</p>
+          <p class="hint" id="step1Hint">נא למלא את הפרטים האישיים שלך</p>
           <div class="field"><label>שם פרטי ומשפחה</label><input type="text" id="f_name" placeholder="לדוגמה: ישראל ישראלי"></div>
-          <div class="field"><label>דוא"ל</label><input type="email" id="f_email" placeholder="name@example.com"></div>
-          <div class="field"><label>נייד</label><input type="tel" id="f_phone" placeholder="050-0000000"></div>
+          <div class="field">
+            <label>דוא"ל</label>
+            <input type="email" id="f_email" placeholder="name@example.com">
+            <div class="error-text" id="errEmail">נא להזין כתובת דוא"ל תקינה.</div>
+          </div>
+          <div class="field">
+            <label>נייד</label>
+            <input type="tel" id="f_phone" placeholder="050-0000000" inputmode="numeric">
+            <div class="error-text" id="errPhone">נא להזין מספר טלפון תקין (ספרות בלבד).</div>
+          </div>
           <div class="field"><label>כתובת</label><input type="text" id="f_address" placeholder="עיר, רחוב ומספר"></div>
           <div class="row2">
             <div class="field"><label>תאריך לידה</label><input type="date" id="f_dob"></div>
@@ -814,8 +781,7 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
               </select>
             </div>
           </div>
-          <div class="field"><label>פרטי עיסוק</label><input type="text" id="f_occupation" placeholder="תחום עיסוק / תפקיד"></div>
-          <div class="error-text" id="err1">נא למלא שם, דוא"ל ונייד לפני המשך.</div>
+          <div class="error-text" id="err1">נא למלא שם, דוא"ל ונייד תקינים לפני המשך.</div>
         </div>
       `;
     }
@@ -895,7 +861,26 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
       if(state.trainee_address) $('f_address').value = state.trainee_address;
       if(state.trainee_dob) $('f_dob').value = state.trainee_dob;
       if(state.trainee_marital) $('f_marital').value = state.trainee_marital;
-      if(state.trainee_occupation) $('f_occupation').value = state.trainee_occupation;
+
+      if(state.traineeLookupPending){
+        $('step1Hint').textContent = 'טוען את הפרטים שלך מהמערכת...';
+      }
+
+      $('f_phone').addEventListener('input', (e)=>{
+        const cleaned = e.target.value.replace(/[^\d\s\-()]/g, '');
+        if(cleaned !== e.target.value) e.target.value = cleaned;
+      });
+      $('f_email').addEventListener('blur', ()=>{
+        const email = $('f_email').value.trim();
+        const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+        setErr('errEmail', email.length>0 && !emailValid);
+      });
+      $('f_phone').addEventListener('blur', ()=>{
+        const phone = $('f_phone').value.trim();
+        const phoneDigitsOnly = phone.replace(/[\s\-()]/g, '');
+        const phoneValid = /^\d{7,15}$/.test(phoneDigitsOnly);
+        setErr('errPhone', phone.length>0 && !phoneValid);
+      });
     }
 
     function wireStep2(){
@@ -935,7 +920,7 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
       } else {
         const send = document.createElement('button');
         send.className = 'btn btn-primary';
-        send.textContent = 'שלח טופס וצור קישור למאמן/ת';
+        send.textContent = 'הפק PDF וסיים';
         send.onclick = finalizeSubmission;
         box.appendChild(send);
       }
@@ -952,13 +937,17 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
         const name = $('f_name').value.trim();
         const email = $('f_email').value.trim();
         const phone = $('f_phone').value.trim();
-        if(!name || !email || !phone){ setErr('err1', true); return; }
+        const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+        const phoneDigitsOnly = phone.replace(/[\s\-()]/g, '');
+        const phoneValid = /^\d{7,15}$/.test(phoneDigitsOnly);
+        setErr('errEmail', email.length>0 && !emailValid);
+        setErr('errPhone', phone.length>0 && !phoneValid);
+        if(!name || !email || !phone || !emailValid || !phoneValid){ setErr('err1', true); return; }
         setErr('err1', false);
         state.trainee_name = name; state.trainee_email = email; state.trainee_phone = phone;
         state.trainee_address = $('f_address').value.trim();
         state.trainee_dob = $('f_dob').value;
         state.trainee_marital = $('f_marital').value;
-        state.trainee_occupation = $('f_occupation').value.trim();
       }
       if(current===2){
         const q1 = document.querySelector('input[name=q1]:checked');
@@ -995,97 +984,63 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
         ['כתובת', state.trainee_address || '—'],
         ['תאריך לידה', state.trainee_dob || '—'],
         ['מצב משפחתי', state.trainee_marital || '—'],
-        ['עיסוק', state.trainee_occupation || '—'],
       ];
       $('summaryBox').innerHTML = rows.map(r=>`<div class="summary-row"><span class="k">${r[0]}</span><span class="v">${r[1]}</span></div>`).join('');
     }
 
     async function finalizeSubmission(){
+      const record = {
+        trainerId: state.trainerId, trainerName: state.trainerName, trainerEmail: state.trainerEmail,
+        trainee: {
+          name: state.trainee_name, email: state.trainee_email, phone: state.trainee_phone,
+          address: state.trainee_address, dob: state.trainee_dob, marital: state.trainee_marital
+        },
+        health: state.health,
+        traineeSignature: state.traineeSignature,
+        traineeSignedAt: state.traineeSignedAt,
+        coachSignature: null,
+        coachSignedAt: null,
+      };
+
       $('loadingOverlay').classList.add('show');
-      $('loadingText').textContent = 'שומר ויוצר קישור...';
+      $('loadingText').textContent = 'מפיק PDF...';
+      let pdfOk = false;
       try{
-        const record = {
-          trainerId: state.trainerId, trainerName: state.trainerName, trainerEmail: state.trainerEmail,
-          trainee: {
-            name: state.trainee_name, email: state.trainee_email, phone: state.trainee_phone,
-            address: state.trainee_address, dob: state.trainee_dob, marital: state.trainee_marital, occupation: state.trainee_occupation
-          },
-          health: state.health,
-          traineeSignature: state.traineeSignature,
-          traineeSignedAt: state.traineeSignedAt,
-          coachSignature: null,
-          coachSignedAt: null,
-        };
-
-        const token = await submitAgreement(
-          state.traineeRecordId,
-          record,
-          state.trainerId,
-          state.traineeManual ? state.trainee_name : null
-        );
-        const link = buildLink(token);
-
-        const subject = encodeURIComponent('השלמת חתימה - טופס תהליך אימון: ' + record.trainee.name);
-        const body = encodeURIComponent(
-          `שלום ${record.trainerName},\n\n` +
-          `${record.trainee.name} מילא/ה וחתם/ה על טופס פרטי מתאמן ותהליך אימון.\n` +
-          `להשלמת התהליך, נא לפתוח את הקישור ולהוסיף את חתימתך:\n\n${link}\n\n` +
-          `בית הספר למנהיגות תודעתית`
-        );
-        const mailtoHref = `mailto:${encodeURIComponent(record.trainerEmail||'')}?subject=${subject}&body=${body}`;
-
-        $('statusBadge').textContent = 'הטופס נשמר! כעת יש לשתף את הקישור עם המאמן/ת';
-        $('statusBadge').className = 'badge done';
-
-        $('content').innerHTML = `
-          <div class="card">
-            <span class="badge done">נשלח בהצלחה</span>
-            <h2>תודה, ${record.trainee.name}!</h2>
-            <p class="hint">החתימה שלך נשמרה. כדי לסיים את התהליך, יש להעביר את הקישור הבא ל${record.trainerName} כדי שיחתום/תחתום גם הוא/היא.</p>
-            <input class="link-box" id="linkBox" readonly value="${link.replace(/"/g,'&quot;')}">
-            <p class="hint" style="margin:4px 0 10px;font-size:12px;">אם ההעתקה האוטומטית לא עובדת, אפשר ללחוץ על השדה ולהעתיק ידנית (החזק/י והעתק/י).</p>
-            <button class="copy-btn" id="copyLinkBtn">העתק קישור</button>
-            <a class="btn btn-primary btn-full" style="margin-top:10px;" href="${mailtoHref}">פתח טיוטת מייל למאמן/ת</a>
-            <button class="btn btn-secondary btn-full" style="margin-top:10px;" id="downloadPdfBtn">הורד PDF (חתימת מתאמן בלבד)</button>
-          </div>
-        `;
-        $('navButtons').innerHTML = '';
-        $('linkBox').addEventListener('click', ()=> $('linkBox').select());
-        $('copyLinkBtn').addEventListener('click', ()=> copyLinkToClipboard(link));
-        $('downloadPdfBtn').addEventListener('click', ()=> downloadPdfWithFeedback(record));
+        await downloadPdf(record);
+        pdfOk = true;
       } catch(e){
         console.error(e);
-        $('content').innerHTML = `
-          <div class="card">
-            <span class="badge wait" style="background:#FBEFE9;color:var(--accent);">שגיאה</span>
-            <h2>קרתה תקלה לא צפויה</h2>
-            <p class="hint">החתימה שלך נקלטה, אך נכשלנו בשמירה (${(e&&e.message)||'שגיאה לא ידועה'}). אפשר לנסות שוב, או להוריד PDF עם הפרטים והחתימה ולשלוח אותו ישירות.</p>
-          </div>
-        `;
-        $('navButtons').innerHTML = '';
-        const retryBtn = document.createElement('button');
-        retryBtn.className = 'btn btn-primary btn-full';
-        retryBtn.textContent = 'נסה לשמור שוב';
-        retryBtn.onclick = finalizeSubmission;
-        $('navButtons').appendChild(retryBtn);
-        const pdfFallbackBtn = document.createElement('button');
-        pdfFallbackBtn.className = 'btn btn-secondary btn-full';
-        pdfFallbackBtn.style.marginTop = '10px';
-        pdfFallbackBtn.textContent = 'הורד PDF עם הפרטים שלי';
-        pdfFallbackBtn.onclick = ()=> downloadPdfWithFeedback({
-          trainerName: state.trainerName, trainerEmail: state.trainerEmail,
-          trainee: {
-            name: state.trainee_name, email: state.trainee_email, phone: state.trainee_phone,
-            address: state.trainee_address, dob: state.trainee_dob, marital: state.trainee_marital, occupation: state.trainee_occupation
-          },
-          health: state.health,
-          traineeSignature: state.traineeSignature, traineeSignedAt: state.traineeSignedAt,
-          coachSignature: null, coachSignedAt: null
-        });
-        $('navButtons').appendChild(pdfFallbackBtn);
       } finally {
         $('loadingOverlay').classList.remove('show');
       }
+
+      const subject = encodeURIComponent('טופס פרטי מתאמן ותהליך אימון - ' + record.trainee.name);
+      const body = encodeURIComponent(
+        `שלום ${record.trainerName||''},\n\n` +
+        `מצורף הטופס החתום שלי (פרטי מתאמן ותהליך אימון).\n` +
+        `נא לאשר קבלה.\n\n` +
+        `תודה,\n${record.trainee.name}`
+      );
+      const mailtoHref = `mailto:${encodeURIComponent(record.trainerEmail||'')}?subject=${subject}&body=${body}`;
+
+      $('statusBadge').textContent = pdfOk ? 'ה-PDF הופק והורד בהצלחה' : 'התרחשה שגיאה בהפקת ה-PDF';
+      $('statusBadge').className = pdfOk ? 'badge done' : 'badge wait';
+
+      const pdfNote = pdfOk
+        ? `<p class="hint">קובץ ה-PDF הורד למכשירך. <strong>חשוב: יש לשלוח את הקובץ ל${record.trainerName||'המאמן/ת שלך'} באופן ישיר</strong> (במייל, וואטסאפ, או כל דרך אחרת) — הטופס לא נשלח אוטומטית.</p>`
+        : `<p class="hint" style="color:var(--accent);">הפקת ה-PDF נכשלה. אפשר לנסות שוב בכפתור למטה.</p>`;
+
+      $('content').innerHTML = `
+        <div class="card">
+          <span class="badge ${pdfOk ? 'done' : 'wait'}" id="statusBadge2">${pdfOk ? 'הטופס הושלם' : 'שגיאה'}</span>
+          <h2>תודה, ${record.trainee.name}!</h2>
+          ${pdfNote}
+          <button class="btn btn-secondary btn-full" id="downloadPdfBtn">${pdfOk ? 'הורד שוב את ה-PDF' : 'נסה להפיק PDF שוב'}</button>
+          ${record.trainerEmail ? `<a class="btn btn-primary btn-full" style="margin-top:10px;" href="${mailtoHref}">פתח טיוטת מייל למאמן/ת</a>` : ''}
+        </div>
+      `;
+      $('navButtons').innerHTML = '';
+      $('downloadPdfBtn').addEventListener('click', ()=> downloadPdfWithFeedback(record));
     }
 
     // Single delegated listener for the whole trainee flow, registered once, always null-safe.
@@ -1099,167 +1054,7 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
     return { start: ()=>{ renderProgress(); renderStep(); } };
   })();
 
-  // ================= COACH FLOW =================
-  const CoachFlow = (function(){
-    let record = null;
-
-    function renderLoading(){
-      $('progressBar').innerHTML = '';
-      $('content').innerHTML = `<div class="card"><p class="hint">טוען את הטופס...</p></div>`;
-      $('navButtons').innerHTML = '';
-    }
-
-    function renderNotFound(){
-      $('content').innerHTML = `
-        <div class="card success-screen">
-          <div class="check" style="background:#FBEFE9;color:var(--accent);">!</div>
-          <h2>הטופס לא נמצא</h2>
-          <p>הקישור שגוי או שהטופס נמחק. נא לבדוק את הקישור עם המתאמן/ת ששלח/ה אותו.</p>
-        </div>
-      `;
-      $('navButtons').innerHTML = '';
-    }
-
-    function renderLoadError(message, retryFn){
-      $('content').innerHTML = `
-        <div class="card success-screen">
-          <div class="check" style="background:#FBEFE9;color:var(--accent);">!</div>
-          <h2>לא הצלחנו לטעון את הטופס</h2>
-          <p>${message}</p>
-        </div>
-      `;
-      $('navButtons').innerHTML = '';
-      const retryBtn = document.createElement('button');
-      retryBtn.className = 'btn btn-primary btn-full';
-      retryBtn.textContent = 'נסה שוב';
-      retryBtn.onclick = retryFn;
-      $('navButtons').appendChild(retryBtn);
-    }
-
-    function renderSummaryReadonly(r){
-      const rows = [
-        ['מתאמן/ת', r.trainee.name],
-        ['דוא"ל', r.trainee.email],
-        ['נייד', r.trainee.phone],
-        ['כתובת', r.trainee.address || '—'],
-        ['תאריך לידה', r.trainee.dob || '—'],
-        ['מצב משפחתי', r.trainee.marital || '—'],
-        ['עיסוק', r.trainee.occupation || '—'],
-        ['טיפול קודם', r.health.q1 + (r.health.q1_detail ? ' · '+r.health.q1_detail : '')],
-        ['מחלה נפשית', r.health.q2 + (r.health.q2_detail ? ' · '+r.health.q2_detail : '')],
-        ['תרופות קבועות', r.health.q3 + (r.health.q3_detail ? ' · '+r.health.q3_detail : '')],
-        ['התקבל ב', r.traineeSignedAt ? new Date(r.traineeSignedAt).toLocaleString('he-IL') : '—'],
-      ];
-      return `<div class="readonly-card">${rows.map(x=>`<div class="summary-row"><span class="k">${x[0]}</span><span class="v">${x[1]}</span></div>`).join('')}</div>`;
-    }
-
-    function renderPendingView(r){
-      $('progressBar').innerHTML = '';
-      $('content').innerHTML = `
-        <div class="card">
-          <span class="badge wait">ממתין לחתימתך</span>
-          <h2>שלום ${r.trainerName}</h2>
-          <p class="hint">${r.trainee.name} מילא/ה וחתם/ה על הטופס. נא לעיין בפרטים ולהוסיף את חתימתך להשלמת התהליך.</p>
-          ${renderSummaryReadonly(r)}
-          <div style="margin-bottom:14px;">
-            <button type="button" id="toggleTerms" class="btn btn-secondary btn-full" style="margin-bottom:10px;">הצג/הסתר את תנאי התהליך המלאים</button>
-            <div id="termsBlock" style="display:none;">${TERMS_HTML}</div>
-          </div>
-          <h2>חתימת המאמן/ת</h2>
-          <div class="sig-pad-wrap"><canvas class="sigpad" id="sigCoach"></canvas><div class="sig-line-label">חתימת המאמן/ת</div></div>
-          <button class="sig-clear" id="clearCoachSig">נקה חתימה</button>
-          <div class="error-text" id="errCoach">נא לחתום לפני אישור.</div>
-        </div>
-      `;
-      setupPad($('sigCoach'));
-      $('clearCoachSig').onclick = ()=> $('sigCoach')._clear();
-      $('toggleTerms').onclick = ()=>{
-        const b = $('termsBlock');
-        b.style.display = b.style.display === 'none' ? 'block' : 'none';
-      };
-
-      $('navButtons').innerHTML = '';
-      const confirmBtn = document.createElement('button');
-      confirmBtn.className = 'btn btn-primary btn-full';
-      confirmBtn.textContent = 'אשר וחתום';
-      confirmBtn.onclick = async ()=>{
-        const pad = $('sigCoach');
-        if(!pad._hasInk()){ $('errCoach').classList.add('show'); return; }
-        $('errCoach').classList.remove('show');
-        $('loadingOverlay').classList.add('show');
-        $('loadingText').textContent = 'שומר חתימה...';
-        try{
-          const coachSignature = pad._dataUrl();
-          const coachSignedAt = new Date().toISOString();
-          const updated = await completeAgreement(r.token, coachSignature, coachSignedAt);
-          renderCompletedView(updated);
-        } catch(e){
-          console.error(e);
-          $('content').innerHTML = `
-            <div class="card">
-              <span class="badge wait" style="background:#FBEFE9;color:var(--accent);">שגיאה</span>
-              <h2>קרתה תקלה לא צפויה</h2>
-              <p class="hint">${(e&&e.message)||'שגיאה לא ידועה'}. אפשר לנסות שוב, או להוריד PDF עם הפרטים הקיימים.</p>
-            </div>
-          `;
-          $('navButtons').innerHTML = '';
-          const retryBtn = document.createElement('button');
-          retryBtn.className = 'btn btn-primary btn-full';
-          retryBtn.textContent = 'נסה לשמור שוב';
-          retryBtn.onclick = ()=> renderPendingView(r);
-          $('navButtons').appendChild(retryBtn);
-          const pdfBtn = document.createElement('button');
-          pdfBtn.className = 'btn btn-secondary btn-full';
-          pdfBtn.style.marginTop = '10px';
-          pdfBtn.textContent = 'הורד PDF עם המצב הנוכחי';
-          pdfBtn.onclick = ()=> downloadPdfWithFeedback(r);
-          $('navButtons').appendChild(pdfBtn);
-        } finally {
-          $('loadingOverlay').classList.remove('show');
-        }
-      };
-      $('navButtons').appendChild(confirmBtn);
-    }
-
-    function renderCompletedView(r){
-      $('progressBar').innerHTML = '';
-      $('content').innerHTML = `
-        <div class="card success-screen">
-          <div class="check">✓</div>
-          <h2>התהליך הושלם!</h2>
-          <p>שני הצדדים חתמו על הטופס. ניתן להוריד כעת את ה-PDF הסופי הכולל את שתי החתימות.</p>
-          <button class="btn btn-primary btn-full" id="downloadFinalPdf">הורד PDF סופי</button>
-        </div>
-      `;
-      $('navButtons').innerHTML = '';
-      $('downloadFinalPdf').addEventListener('click', ()=> downloadPdfWithFeedback(r));
-    }
-
-    async function start(token){
-      renderLoading();
-      const result = await loadAgreementByToken(token);
-      if(result.error){
-        renderLoadError(result.error, ()=> start(token));
-        return;
-      }
-      if(!result.record){ renderNotFound(); return; }
-      record = result.record;
-      record.token = token;
-      if(record.status === 'completed'){ renderCompletedView(record); }
-      else { renderPendingView(record); }
-    }
-
-    return { start };
-  })();
-
-  // ================= ROUTER =================
-  const params = new URLSearchParams(window.location.search);
-  const tokenParam = params.get('token');
-  if(tokenParam){
-    CoachFlow.start(tokenParam);
-  } else {
-    TraineeFlow.start();
-  }
+  TraineeFlow.start();
 })();
 </script>
 </body>
