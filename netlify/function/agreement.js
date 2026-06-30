@@ -19,6 +19,7 @@ const FIELD_TRAINEE_FIRST = 'fld6C8N4F4VkWYqk3'; // First_name
 const FIELD_TRAINEE_LAST = 'fldmil8JbLf5XwkeQ'; // Last_name
 const FIELD_TRAINEE_EMAIL = 'fld2FX4Jcyiq1MM0r'; // Email
 const FIELD_TRAINEE_PHONE = 'fldBWWx7DKXRHn2tV'; // Phone
+const FIELD_TRAINEE_ASSIGNED_COACH = 'fldujbvnQ6SuWdhL2'; // מאמן משוייך
 const FIELD_COACH_TRAINEES = 'fldWUhOR2OnQBwqaz'; // תלמידים משוייכים למאמן (on the צוות record)
 
 const AIRTABLE_API_BASE = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}`;
@@ -145,14 +146,41 @@ exports.handler = async (event) => {
     }
 
     if (action === 'submit') {
-      const { traineeRecordId, record } = payload;
-      if (!traineeRecordId || !record) {
-        return jsonResponse(400, { error: 'Missing traineeRecordId or record' });
+      const { traineeRecordId, record, coachAirtableId, manualTraineeName } = payload;
+      if (!record) {
+        return jsonResponse(400, { error: 'Missing record' });
       }
       const token = genToken();
       const storedRecord = { ...record, token, status: 'pending_coach' };
 
-      await airtableFetch(TRAINEE_API_BASE, `/${traineeRecordId}`, {
+      let targetRecordId = traineeRecordId;
+
+      if (!targetRecordId) {
+        // Manual entry: the trainee wasn't found in the coach's existing list,
+        // so create a new record in the trainees table instead of patching one.
+        if (!manualTraineeName || !coachAirtableId) {
+          return jsonResponse(400, { error: 'Missing manualTraineeName or coachAirtableId for manual entry' });
+        }
+        const nameParts = manualTraineeName.trim().split(/\s+/);
+        const firstName = nameParts[0] || manualTraineeName.trim();
+        const lastName = nameParts.slice(1).join(' ') || '';
+
+        const created = await airtableFetch(TRAINEE_API_BASE, '', {
+          method: 'POST',
+          body: JSON.stringify({
+            fields: {
+              [FIELD_TRAINEE_FIRST]: firstName,
+              [FIELD_TRAINEE_LAST]: lastName,
+              [FIELD_TRAINEE_ASSIGNED_COACH]: [coachAirtableId],
+              [FIELD_FORM_DATA]: JSON.stringify(storedRecord),
+              [FIELD_STATUS]: 'ממתין לחתימת מאמן',
+            },
+          }),
+        });
+        return jsonResponse(200, { ok: true, token, createdRecordId: created.id });
+      }
+
+      await airtableFetch(TRAINEE_API_BASE, `/${targetRecordId}`, {
         method: 'PATCH',
         body: JSON.stringify({
           fields: {
