@@ -1,30 +1,21 @@
 // netlify/functions/agreement.js
 //
-// Single serverless endpoint that the form calls instead of window.storage.
-// Holds the Airtable API token server-side (set as an environment variable
-// in the Netlify site settings — never shipped to the browser).
-//
-// Routes (all POST, distinguished by body.action):
-//   "trainees" - list trainees linked to a given coach (for the dropdown)
-//   "submit"   - trainee finished signing -> write into their existing row, return a token
-//   "load"     - coach opened their link -> fetch the row by token
-//   "complete" - coach finished signing -> update the row
+// Minimal serverless endpoint. The form is now a single-session flow with no
+// coach-signature step and no shareable link — it only needs to fetch a
+// trainee's existing contact details (email/phone) from Airtable to
+// auto-fill the form when the trainee selects themselves from their coach's
+// list. Manual-entry trainees (not in the list) skip this lookup entirely
+// and just type their own details.
 
 const AIRTABLE_BASE_ID = 'appnKmW94PJcSJX6M';
-const TEAM_TABLE_ID = 'tblKp913IugEJy0Lo'; // צוות (coaches)
-const TRAINEE_TABLE_ID = 'tblqYz0a0fRBmTTnr'; // אנשי קשר (trainees)
-const FIELD_FORM_DATA = 'fldTBTyyBL9iXPVmZ'; // טופס פרטי מתאמן והליך אימון
-const FIELD_STATUS = 'fldSNYxVt9uPU8Twl'; // סטטוס חתימת טופס
+const TRAINEE_TABLE_ID = 'tblqYz0a0fRBmTTnr'; // אנשי קשר
 const FIELD_TRAINEE_FIRST = 'fld6C8N4F4VkWYqk3'; // First_name
 const FIELD_TRAINEE_LAST = 'fldmil8JbLf5XwkeQ'; // Last_name
 const FIELD_TRAINEE_EMAIL = 'fld2FX4Jcyiq1MM0r'; // Email
 const FIELD_TRAINEE_PHONE = 'fldBWWx7DKXRHn2tV'; // Phone
-const FIELD_TRAINEE_ASSIGNED_COACH = 'fldujbvnQ6SuWdhL2'; // מאמן משוייך
-const FIELD_COACH_TRAINEES = 'fldWUhOR2OnQBwqaz'; // תלמידים משוייכים למאמן (on the צוות record)
 
 const AIRTABLE_API_BASE = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}`;
 const TRAINEE_API_BASE = `${AIRTABLE_API_BASE}/${TRAINEE_TABLE_ID}`;
-const TEAM_API_BASE = `${AIRTABLE_API_BASE}/${TEAM_TABLE_ID}`;
 
 function jsonResponse(statusCode, body) {
   return {
@@ -50,35 +41,6 @@ function airtableHeaders() {
   };
 }
 
-// The token embeds the Airtable record ID directly (base64, URL-safe), plus a
-// short HMAC-style check value derived from the API key, so load/complete can
-// fetch the record directly by ID instead of scanning the entire trainees
-// table with a FIND() formula — which was slow enough (thousands of rows) to
-// exceed the function's execution time and leave the coach's page stuck on
-// "loading" forever with no error surfaced.
-function genToken(airtableRecordId) {
-  const crypto = require('crypto');
-  const secret = process.env.AIRTABLE_API_KEY || 'fallback-secret';
-  const check = crypto.createHmac('sha256', secret).update(airtableRecordId).digest('base64url').slice(0, 10);
-  const payload = `${airtableRecordId}.${check}`;
-  return Buffer.from(payload, 'utf-8').toString('base64url');
-}
-
-function parseToken(token) {
-  try {
-    const payload = Buffer.from(token, 'base64url').toString('utf-8');
-    const [recordId, check] = payload.split('.');
-    if (!recordId || !check) return null;
-    const crypto = require('crypto');
-    const secret = process.env.AIRTABLE_API_KEY || 'fallback-secret';
-    const expected = crypto.createHmac('sha256', secret).update(recordId).digest('base64url').slice(0, 10);
-    if (expected !== check) return null;
-    return recordId;
-  } catch (e) {
-    return null;
-  }
-}
-
 async function airtableFetch(baseUrl, path, options) {
   const res = await fetch(`${baseUrl}${path}`, {
     ...options,
@@ -90,50 +52,6 @@ async function airtableFetch(baseUrl, path, options) {
     throw new Error(`Airtable error (${res.status}): ${message}`);
   }
   return data;
-}
-
-async function findRecordByToken(token) {
-  const recordId = parseToken(token);
-  if (!recordId) return null;
-  try {
-    const data = await airtableFetch(TRAINEE_API_BASE, `/${recordId}`, { method: 'GET' });
-    return data;
-  } catch (e) {
-    return null;
-  }
-}
-
-
-async function getCoachWithTrainees(coachRecordId) {
-  const data = await airtableFetch(
-    TEAM_API_BASE,
-    `/${coachRecordId}?fields[]=${FIELD_COACH_TRAINEES}`,
-    { method: 'GET' }
-  );
-  return data;
-}
-
-async function getTraineesByIds(traineeIds) {
-  if (!traineeIds || traineeIds.length === 0) return [];
-  // Airtable has no bulk-get-by-IDs endpoint; fetch each trainee record individually.
-  // Trainee lists per coach are small (typically under ~25), so this stays fast.
-  const results = await Promise.all(
-    traineeIds.map((id) =>
-      airtableFetch(
-        TRAINEE_API_BASE,
-        `/${id}?fields[]=${FIELD_TRAINEE_FIRST}&fields[]=${FIELD_TRAINEE_LAST}&fields[]=${FIELD_TRAINEE_EMAIL}&fields[]=${FIELD_TRAINEE_PHONE}`,
-        { method: 'GET' }
-      ).catch((e) => {
-        console.error(`Failed to fetch trainee ${id}:`, e.message);
-        return { error: true, id, message: e.message };
-      })
-    )
-  );
-  const failures = results.filter((r) => r && r.error);
-  if (failures.length > 0) {
-    console.error(`${failures.length}/${traineeIds.length} trainee fetches failed:`, failures.map((f) => f.message));
-  }
-  return results.filter((r) => r && !r.error);
 }
 
 exports.handler = async (event) => {
@@ -154,112 +72,25 @@ exports.handler = async (event) => {
   const { action } = payload;
 
   try {
-    if (action === 'trainees') {
-      const { coachRecordId } = payload;
-      if (!coachRecordId) return jsonResponse(400, { error: 'Missing coachRecordId' });
+    if (action === 'lookup-trainee') {
+      const { traineeRecordId } = payload;
+      if (!traineeRecordId) return jsonResponse(400, { error: 'Missing traineeRecordId' });
 
-      const coach = await getCoachWithTrainees(coachRecordId);
-      const traineeIds = (coach.fields && coach.fields[FIELD_COACH_TRAINEES]) || [];
-      const traineeRecords = await getTraineesByIds(traineeIds);
+      const record = await airtableFetch(
+        TRAINEE_API_BASE,
+        `/${traineeRecordId}?fields[]=${FIELD_TRAINEE_FIRST}&fields[]=${FIELD_TRAINEE_LAST}&fields[]=${FIELD_TRAINEE_EMAIL}&fields[]=${FIELD_TRAINEE_PHONE}`,
+        { method: 'GET' }
+      );
 
-      const trainees = traineeRecords.map((r) => ({
-        id: r.id,
-        firstName: r.fields[FIELD_TRAINEE_FIRST] || '',
-        lastName: r.fields[FIELD_TRAINEE_LAST] || '',
-        email: r.fields[FIELD_TRAINEE_EMAIL] || '',
-        phone: r.fields[FIELD_TRAINEE_PHONE] || '',
-      }));
-
-      return jsonResponse(200, { ok: true, trainees });
-    }
-
-    if (action === 'submit') {
-      const { traineeRecordId, record, coachAirtableId, manualTraineeName } = payload;
-      if (!record) {
-        return jsonResponse(400, { error: 'Missing record' });
-      }
-
-      let targetRecordId = traineeRecordId;
-
-      if (!targetRecordId) {
-        // Manual entry: the trainee wasn't found in the coach's existing list,
-        // so create a new record in the trainees table instead of patching one.
-        // The token can only be derived once Airtable assigns a record ID, so
-        // the record is created first with a placeholder, then patched with
-        // the real token in a second call.
-        if (!manualTraineeName || !coachAirtableId) {
-          return jsonResponse(400, { error: 'Missing manualTraineeName or coachAirtableId for manual entry' });
-        }
-        const nameParts = manualTraineeName.trim().split(/\s+/);
-        const firstName = nameParts[0] || manualTraineeName.trim();
-        const lastName = nameParts.slice(1).join(' ') || '';
-
-        const created = await airtableFetch(TRAINEE_API_BASE, '', {
-          method: 'POST',
-          body: JSON.stringify({
-            fields: {
-              [FIELD_TRAINEE_FIRST]: firstName,
-              [FIELD_TRAINEE_LAST]: lastName,
-              [FIELD_TRAINEE_ASSIGNED_COACH]: [coachAirtableId],
-              [FIELD_STATUS]: 'ממתין לחתימת מאמן',
-            },
-          }),
-        });
-        targetRecordId = created.id;
-      }
-
-      const token = genToken(targetRecordId);
-      const storedRecord = { ...record, token, status: 'pending_coach' };
-
-      await airtableFetch(TRAINEE_API_BASE, `/${targetRecordId}`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          fields: {
-            [FIELD_FORM_DATA]: JSON.stringify(storedRecord),
-            [FIELD_STATUS]: 'ממתין לחתימת מאמן',
-          },
-        }),
+      return jsonResponse(200, {
+        ok: true,
+        trainee: {
+          firstName: record.fields[FIELD_TRAINEE_FIRST] || '',
+          lastName: record.fields[FIELD_TRAINEE_LAST] || '',
+          email: record.fields[FIELD_TRAINEE_EMAIL] || '',
+          phone: record.fields[FIELD_TRAINEE_PHONE] || '',
+        },
       });
-
-      return jsonResponse(200, { ok: true, token });
-    }
-
-    if (action === 'load') {
-      const { token } = payload;
-      if (!token) return jsonResponse(400, { error: 'Missing token' });
-
-      const airtableRecord = await findRecordByToken(token);
-      if (!airtableRecord) return jsonResponse(404, { error: 'not_found' });
-
-      const stored = JSON.parse(airtableRecord.fields[FIELD_FORM_DATA] || '{}');
-      return jsonResponse(200, { ok: true, record: stored, airtableRecordId: airtableRecord.id });
-    }
-
-    if (action === 'complete') {
-      const { token, coachSignature, coachSignedAt } = payload;
-      if (!token || !coachSignature) {
-        return jsonResponse(400, { error: 'Missing token or coachSignature' });
-      }
-
-      const airtableRecord = await findRecordByToken(token);
-      if (!airtableRecord) return jsonResponse(404, { error: 'not_found' });
-
-      const stored = JSON.parse(airtableRecord.fields[FIELD_FORM_DATA] || '{}');
-      stored.coachSignature = coachSignature;
-      stored.coachSignedAt = coachSignedAt;
-      stored.status = 'completed';
-
-      await airtableFetch(TRAINEE_API_BASE, `/${airtableRecord.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({
-          fields: {
-            [FIELD_FORM_DATA]: JSON.stringify(stored),
-            [FIELD_STATUS]: 'הושלם - שני חתימות',
-          },
-        }),
-      });
-
-      return jsonResponse(200, { ok: true, record: stored });
     }
 
     return jsonResponse(400, { error: 'Unknown action' });
