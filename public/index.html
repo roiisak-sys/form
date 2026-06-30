@@ -212,13 +212,21 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
   async function apiCall(action, body){
     let res;
     try{
-      res = await fetch(API_ENDPOINT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(Object.assign({ action }, body)),
-      });
+      const controller = new AbortController();
+      const timeoutId = setTimeout(()=> controller.abort(), 15000);
+      try{
+        res = await fetch(API_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(Object.assign({ action }, body)),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
     } catch(e){
-      throw new Error('לא ניתן להתחבר לשרת: ' + (e && e.message ? e.message : e));
+      const isTimeout = e && e.name === 'AbortError';
+      throw new Error(isTimeout ? 'השרת לא הגיב בזמן — נסה/י שוב.' : 'לא ניתן להתחבר לשרת: ' + (e && e.message ? e.message : e));
     }
     let data;
     try{ data = await res.json(); } catch(e){ data = null; }
@@ -236,9 +244,9 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
   async function loadAgreementByToken(token){
     try{
       const data = await apiCall('load', { token });
-      return data.record;
+      return { record: data.record, error: null };
     } catch(e){
-      return null;
+      return { record: null, error: e.message || 'שגיאה לא ידועה' };
     }
   }
 
@@ -1112,6 +1120,22 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
       $('navButtons').innerHTML = '';
     }
 
+    function renderLoadError(message, retryFn){
+      $('content').innerHTML = `
+        <div class="card success-screen">
+          <div class="check" style="background:#FBEFE9;color:var(--accent);">!</div>
+          <h2>לא הצלחנו לטעון את הטופס</h2>
+          <p>${message}</p>
+        </div>
+      `;
+      $('navButtons').innerHTML = '';
+      const retryBtn = document.createElement('button');
+      retryBtn.className = 'btn btn-primary btn-full';
+      retryBtn.textContent = 'נסה שוב';
+      retryBtn.onclick = retryFn;
+      $('navButtons').appendChild(retryBtn);
+    }
+
     function renderSummaryReadonly(r){
       const rows = [
         ['מתאמן/ת', r.trainee.name],
@@ -1213,8 +1237,13 @@ const HEBREW_FONT_BOLD_BASE64 = "AAEAAAAPAIAAAwBwR0RFRhijGYkAAD7AAAAB9kdQT1PGUNj
 
     async function start(token){
       renderLoading();
-      record = await loadAgreementByToken(token);
-      if(!record){ renderNotFound(); return; }
+      const result = await loadAgreementByToken(token);
+      if(result.error){
+        renderLoadError(result.error, ()=> start(token));
+        return;
+      }
+      if(!result.record){ renderNotFound(); return; }
+      record = result.record;
       record.token = token;
       if(record.status === 'completed'){ renderCompletedView(record); }
       else { renderPendingView(record); }
