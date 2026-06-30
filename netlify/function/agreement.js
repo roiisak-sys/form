@@ -50,10 +50,33 @@ function airtableHeaders() {
   };
 }
 
-function genToken() {
-  // 24 random bytes, URL-safe — used as the secret in the coach's link.
-  const bytes = require('crypto').randomBytes(18);
-  return bytes.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+// The token embeds the Airtable record ID directly (base64, URL-safe), plus a
+// short HMAC-style check value derived from the API key, so load/complete can
+// fetch the record directly by ID instead of scanning the entire trainees
+// table with a FIND() formula — which was slow enough (thousands of rows) to
+// exceed the function's execution time and leave the coach's page stuck on
+// "loading" forever with no error surfaced.
+function genToken(airtableRecordId) {
+  const crypto = require('crypto');
+  const secret = process.env.AIRTABLE_API_KEY || 'fallback-secret';
+  const check = crypto.createHmac('sha256', secret).update(airtableRecordId).digest('base64url').slice(0, 10);
+  const payload = `${airtableRecordId}.${check}`;
+  return Buffer.from(payload, 'utf-8').toString('base64url');
+}
+
+function parseToken(token) {
+  try {
+    const payload = Buffer.from(token, 'base64url').toString('utf-8');
+    const [recordId, check] = payload.split('.');
+    if (!recordId || !check) return null;
+    const crypto = require('crypto');
+    const secret = process.env.AIRTABLE_API_KEY || 'fallback-secret';
+    const expected = crypto.createHmac('sha256', secret).update(recordId).digest('base64url').slice(0, 10);
+    if (expected !== check) return null;
+    return recordId;
+  } catch (e) {
+    return null;
+  }
 }
 
 async function airtableFetch(baseUrl, path, options) {
@@ -70,11 +93,16 @@ async function airtableFetch(baseUrl, path, options) {
 }
 
 async function findRecordByToken(token) {
-  const formula = encodeURIComponent(`FIND("\\"token\\":\\"${token}\\"", {${FIELD_FORM_DATA}})`);
-  const data = await airtableFetch(TRAINEE_API_BASE, `?filterByFormula=${formula}&maxRecords=1`, { method: 'GET' });
-  if (!data.records || data.records.length === 0) return null;
-  return data.records[0];
+  const recordId = parseToken(token);
+  if (!recordId) return null;
+  try {
+    const data = await airtableFetch(TRAINEE_API_BASE, `/${recordId}`, { method: 'GET' });
+    return data;
+  } catch (e) {
+    return null;
+  }
 }
+
 
 async function getCoachWithTrainees(coachRecordId) {
   const data = await airtableFetch(
@@ -150,14 +178,15 @@ exports.handler = async (event) => {
       if (!record) {
         return jsonResponse(400, { error: 'Missing record' });
       }
-      const token = genToken();
-      const storedRecord = { ...record, token, status: 'pending_coach' };
 
       let targetRecordId = traineeRecordId;
 
       if (!targetRecordId) {
         // Manual entry: the trainee wasn't found in the coach's existing list,
         // so create a new record in the trainees table instead of patching one.
+        // The token can only be derived once Airtable assigns a record ID, so
+        // the record is created first with a placeholder, then patched with
+        // the real token in a second call.
         if (!manualTraineeName || !coachAirtableId) {
           return jsonResponse(400, { error: 'Missing manualTraineeName or coachAirtableId for manual entry' });
         }
@@ -172,13 +201,15 @@ exports.handler = async (event) => {
               [FIELD_TRAINEE_FIRST]: firstName,
               [FIELD_TRAINEE_LAST]: lastName,
               [FIELD_TRAINEE_ASSIGNED_COACH]: [coachAirtableId],
-              [FIELD_FORM_DATA]: JSON.stringify(storedRecord),
               [FIELD_STATUS]: 'ממתין לחתימת מאמן',
             },
           }),
         });
-        return jsonResponse(200, { ok: true, token, createdRecordId: created.id });
+        targetRecordId = created.id;
       }
+
+      const token = genToken(targetRecordId);
+      const storedRecord = { ...record, token, status: 'pending_coach' };
 
       await airtableFetch(TRAINEE_API_BASE, `/${targetRecordId}`, {
         method: 'PATCH',
