@@ -1,6 +1,5 @@
-[build]
-  publish = "public"
-  functions = "netlify/functions"
-
-[functions]
-  node_bundler = "esbuild"
+{
+  "name": "training-agreement-form",
+  "version": "1.0.0",
+  "private": true
+}
